@@ -523,3 +523,222 @@ def plot_cluster_usage(prepped: dict, title: str = "") -> Figure:
     ax.grid(axis="x", linestyle="--", alpha=0.4)
     fig.tight_layout()
     return fig
+
+
+# ---------------------------------------------------------------------------
+# Pitch-type-centric zone plots  (new: colors = pitch type, not cluster)
+# ---------------------------------------------------------------------------
+
+def prep_pitch_type_zone_map(
+    df: pd.DataFrame,
+    game_pk: int,
+    cluster_models: dict | None = None,
+) -> dict:
+    """
+    Organize pitches by pitch_type for a zone scatter plot.
+
+    Cluster hub centers are included as optional overlay markers — they are
+    secondary to pitch type as the primary visual organizer.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Full dataset (all pitch types) with plate_x, plate_z, pitch_type, game_pk.
+    game_pk : int
+    cluster_models : dict[str, PitchTypeClusterModel] | None
+        Maps pitch_type → PitchTypeClusterModel. When provided, hub centers are
+        included in the output.
+
+    Returns
+    -------
+    dict with keys:
+        'pitches'     : pd.DataFrame  (plate_x, plate_z, pitch_type)
+        'pitch_types' : list[str]     sorted by frequency descending
+        'hub_centers' : dict[str, np.ndarray] | None
+                        maps pitch_type → centers array shape (k, 2)
+        'color_map'   : dict[str, str]  pitch_type → hex color
+    """
+    game = df[df["game_pk"] == game_pk].copy()
+    game = game.dropna(subset=[config.PLATE_X_COL, config.PLATE_Z_COL,
+                                config.PITCH_TYPE_COL])
+
+    # Sort pitch types by frequency descending
+    freq = game[config.PITCH_TYPE_COL].value_counts()
+    pitch_types = list(freq.index)
+
+    # Build color map using PITCH_TYPE_COLORS
+    color_map = {
+        pt: config.PITCH_TYPE_COLORS.get(pt, config.PITCH_TYPE_COLORS["_default"])
+        for pt in pitch_types
+    }
+
+    hub_centers: dict | None = None
+    if cluster_models is not None:
+        hub_centers = {}
+        for pt, model in cluster_models.items():
+            if model is not None and pt in pitch_types:
+                hub_centers[pt] = model.centers
+
+    pitches = game[[config.PLATE_X_COL, config.PLATE_Z_COL,
+                    config.PITCH_TYPE_COL]].copy()
+
+    return {
+        "pitches": pitches,
+        "pitch_types": pitch_types,
+        "hub_centers": hub_centers,
+        "color_map": color_map,
+    }
+
+
+def plot_pitch_type_zone_map(prepped: dict, title: str = "") -> Figure:
+    """
+    Strike zone scatter colored by pitch type.
+
+    Cluster hubs are shown as small diamond markers when hub_centers are
+    provided. Legend labels are pitch type codes (FF, SL, CH), not cluster IDs.
+
+    Parameters
+    ----------
+    prepped : dict
+        Output of prep_pitch_type_zone_map().
+    title : str
+
+    Returns
+    -------
+    Figure
+    """
+    pitches = prepped["pitches"]
+    pitch_types = prepped["pitch_types"]
+    color_map = prepped["color_map"]
+    hub_centers = prepped.get("hub_centers")
+
+    fig, ax = plt.subplots(figsize=(6, 7), dpi=config.FIGURE_DPI)
+
+    for pt in pitch_types:
+        color = color_map.get(pt, "#888888")
+        subset = pitches[pitches[config.PITCH_TYPE_COL] == pt]
+        ax.scatter(
+            subset[config.PLATE_X_COL],
+            subset[config.PLATE_Z_COL],
+            c=color,
+            alpha=0.40,
+            s=20,
+            label=f"{pt} (n={len(subset)})",
+            zorder=3,
+        )
+
+    # Overlay cluster hubs as diamond markers (secondary layer)
+    if hub_centers:
+        for pt, centers in hub_centers.items():
+            color = color_map.get(pt, "#888888")
+            for i, center in enumerate(centers):
+                ax.scatter(
+                    center[0],
+                    center[1],
+                    c=color,
+                    marker="D",
+                    s=60,
+                    edgecolors="black",
+                    linewidths=0.8,
+                    zorder=5,
+                )
+
+    _set_zone_axes(ax)
+    ax.legend(fontsize=8, loc="upper right", title="Pitch type")
+    ax.set_title(title or "Pitch Locations by Type", fontsize=11)
+    fig.tight_layout()
+    return fig
+
+
+def plot_arsenal_zone_overview(
+    df: pd.DataFrame,
+    game_pk: int,
+    cluster_models: dict | None = None,
+    max_pitch_types: int = 4,
+    title: str = "",
+) -> Figure:
+    """
+    Multi-panel strike zone overview: one subplot per pitch type.
+
+    Pitches shown as colored scatter; cluster hubs as star markers.
+    Layout: up to 2 columns, rows = ceil(n_types / 2).
+    Consistent axis limits across all subplots.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+    game_pk : int
+    cluster_models : dict[str, PitchTypeClusterModel] | None
+    max_pitch_types : int
+        Maximum number of pitch types to display (most frequent first).
+    title : str
+
+    Returns
+    -------
+    Figure
+    """
+    import math
+
+    prepped = prep_pitch_type_zone_map(df, game_pk, cluster_models)
+    pitch_types = prepped["pitch_types"][:max_pitch_types]
+    pitches = prepped["pitches"]
+    color_map = prepped["color_map"]
+    hub_centers = prepped.get("hub_centers") or {}
+
+    n = len(pitch_types)
+    if n == 0:
+        fig, ax = plt.subplots(figsize=(5, 5), dpi=config.FIGURE_DPI)
+        ax.set_title("No pitch data available")
+        return fig
+
+    ncols = min(2, n)
+    nrows = math.ceil(n / ncols)
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=(6 * ncols, 7 * nrows),
+        dpi=config.FIGURE_DPI,
+        squeeze=False,
+    )
+
+    for idx, pt in enumerate(pitch_types):
+        row, col = divmod(idx, ncols)
+        ax = axes[row][col]
+
+        color = color_map.get(pt, "#888888")
+        subset = pitches[pitches[config.PITCH_TYPE_COL] == pt]
+
+        ax.scatter(
+            subset[config.PLATE_X_COL],
+            subset[config.PLATE_Z_COL],
+            c=color,
+            alpha=0.45,
+            s=20,
+            zorder=3,
+        )
+
+        # Hub markers
+        if pt in hub_centers:
+            for center in hub_centers[pt]:
+                ax.scatter(
+                    center[0],
+                    center[1],
+                    c=color,
+                    marker="*",
+                    s=200,
+                    edgecolors="black",
+                    linewidths=0.7,
+                    zorder=5,
+                )
+
+        _set_zone_axes(ax)
+        ax.set_title(f"{pt}  (n={len(subset)})", fontsize=11, color=color)
+
+    # Hide any unused axes
+    for idx in range(n, nrows * ncols):
+        row, col = divmod(idx, ncols)
+        axes[row][col].set_visible(False)
+
+    if title:
+        fig.suptitle(title, fontsize=13, y=1.01)
+    fig.tight_layout()
+    return fig

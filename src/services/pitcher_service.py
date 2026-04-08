@@ -609,3 +609,239 @@ def build_game_report(
         },
         warnings=warnings,
     )
+
+
+# ---------------------------------------------------------------------------
+# Arsenal report (multi-pitch-type)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ArsenalReport:
+    """
+    Full game analysis covering all pitch types simultaneously.
+
+    Primary output of build_arsenal_report(). Organizes analysis by pitch type
+    rather than cluster, giving a comprehensive view of a pitcher's arsenal
+    in a single game.
+
+    Attributes
+    ----------
+    pitcher_id : int
+    game_pk : int
+    game_date : str
+    analyzed_pitch_types : list[str]
+        Types with sufficient in-game pitches (>= min_pitches).
+    cluster_models : dict[str, PitchTypeClusterModel | None]
+        Keyed by pitch_type. None if clustering failed for that type.
+    performance_metrics : dict[str, dict[str, pd.DataFrame]]
+        Keyed by pitch_type → metric_name → DataFrame.
+        Metric names: 'velocity', 'strike_pct', 'whiff_rate',
+                      'zone_pct', 'movement', 'release'
+    rolling_spreads : dict[str, pd.DataFrame]
+        Keyed by pitch_type → rolling spreads DataFrame.
+    rolling_miss : dict[str, pd.DataFrame]
+        Keyed by pitch_type → rolling miss distance DataFrame (empty if no model).
+    pitch_mix_df : pd.DataFrame
+        Cross-pitch rolling mix percentages indexed by game_pitch_index.
+    game_df : pd.DataFrame
+        Full game DataFrame (all pitch types) with cluster assignments and
+        pitch outcome flags.
+    params : dict
+    warnings : list[str]
+    """
+    pitcher_id: int
+    game_pk: int
+    game_date: str
+    analyzed_pitch_types: list[str]
+    cluster_models: dict
+    performance_metrics: dict
+    rolling_spreads: dict
+    rolling_miss: dict
+    pitch_mix_df: pd.DataFrame
+    game_df: pd.DataFrame
+    params: dict
+    warnings: list[str] = field(default_factory=list)
+
+
+def build_arsenal_report(
+    pitcher_id: int | str,
+    game_pk: int,
+    start_date: str,
+    end_date: str,
+    pitch_types: list[str] | None = None,
+    window: int = config.ROLLING_WINDOW_DEFAULT,
+    k: int = config.K_DEFAULT,
+    min_pitches: int = config.MIN_PITCHES_DEFAULT,
+    use_cache: bool = True,
+    cache_dir: Path | None = None,
+) -> ArsenalReport:
+    """
+    Build a full-game analysis covering all pitch types simultaneously.
+
+    Pipeline:
+    1. Fetch + clean data (same as build_game_report)
+    2. Encode pitch outcomes (adds is_strike, is_whiff, is_swing, is_in_zone)
+    3. Determine pitch types to analyze (filter by min_pitches in the game)
+    4. For each pitch type:
+       a. Fit baseline cluster model
+       b. Assign clusters to game
+       c. Compute rolling spreads + miss distance
+       d. Compute all performance metrics
+    5. Compute pitch mix rolling (cross-type)
+    6. Assemble and return ArsenalReport
+
+    Parameters
+    ----------
+    pitcher_id : int or str
+    game_pk : int
+    start_date : str  ('YYYY-MM-DD')
+    end_date : str    ('YYYY-MM-DD')
+    pitch_types : list[str] or None
+        Types to analyze. None = all types with >= min_pitches in the game.
+    window : int, default 7
+    k : int, default 4
+    min_pitches : int, default 15
+    use_cache : bool, default True
+    cache_dir : Path or None
+
+    Returns
+    -------
+    ArsenalReport
+    """
+    from src.features.clustering import assign_clusters_to_game as _assign
+    from src.features.performance import (
+        encode_pitch_outcomes,
+        compute_all_performance_metrics,
+        compute_pitch_mix,
+    )
+
+    warnings_out: list[str] = []
+
+    # Step 1: Load dataset
+    resolved_id = resolve_pitcher_id(pitcher_id)
+    df = get_pitcher_dataset(
+        pitcher_id=resolved_id,
+        start_date=start_date,
+        end_date=end_date,
+        use_cache=use_cache,
+        cache_dir=cache_dir,
+    )
+
+    # Validate game_pk
+    if config.GAME_PK_COL in df.columns:
+        available_games = df[config.GAME_PK_COL].unique().tolist()
+        if game_pk not in available_games:
+            raise ValueError(
+                f"game_pk={game_pk} not found in dataset. "
+                f"Available game_pks: {sorted(available_games)}"
+            )
+
+    # Step 2: Encode pitch outcomes
+    df = encode_pitch_outcomes(df)
+
+    # Step 3: Determine pitch types to analyze
+    if pitch_types is None:
+        pitch_types = get_available_pitch_types(df, min_pitches=min_pitches, game_pk=game_pk)
+    else:
+        # Validate each provided type against available data
+        available_types = df[config.PITCH_TYPE_COL].dropna().unique().tolist()
+        from src.utils.validation import validate_pitch_type
+        validated = []
+        for pt in pitch_types:
+            try:
+                validated.append(validate_pitch_type(pt, available_types))
+            except ValueError as e:
+                warnings_out.append(str(e))
+        pitch_types = validated
+
+    if not pitch_types:
+        raise ValueError(
+            f"No pitch types with >= {min_pitches} pitches found for "
+            f"game_pk={game_pk}. Try a lower min_pitches."
+        )
+
+    # Step 4: Per-pitch-type analysis
+    cluster_models: dict = {}
+    performance_metrics: dict = {}
+    rolling_spreads_by_type: dict = {}
+    rolling_miss_by_type: dict = {}
+
+    # Collect all game rows with cluster labels
+    game_frames = []
+
+    for pt in pitch_types:
+        # 4a. Fit baseline cluster model
+        model = fit_pitch_type_clusters(
+            df=df,
+            pitcher_id=resolved_id,
+            pitch_type=pt,
+            k=k,
+            min_pitches=min_pitches,
+        )
+        cluster_models[pt] = model
+
+        if model is not None and model.k < k:
+            warnings_out.append(
+                f"{pt}: k reduced from {k} to {model.k} "
+                f"({model.n_pitches_fit} baseline pitches)."
+            )
+
+        # 4b. Assign clusters (only if model fitted)
+        if model is not None:
+            game_pt_df = _assign(df=df, game_pk=game_pk, pitch_type=pt, cluster_model=model)
+        else:
+            game_mask = (df[config.GAME_PK_COL] == game_pk) & (df[config.PITCH_TYPE_COL] == pt)
+            game_pt_df = df[game_mask].copy()
+            warnings_out.append(f"{pt}: insufficient data to fit cluster model — miss distance unavailable.")
+
+        game_frames.append(game_pt_df)
+
+        # 4c. Rolling spreads + miss distance
+        spreads = compute_game_rolling_spreads(df=df, game_pk=game_pk, pitch_type=pt, window=window)
+        rolling_spreads_by_type[pt] = spreads
+
+        if model is not None:
+            miss = compute_game_rolling_miss_distance(
+                df=df, game_pk=game_pk, pitch_type=pt, window=window, cluster_model=model
+            )
+        else:
+            miss = pd.DataFrame()
+        rolling_miss_by_type[pt] = miss
+
+        # 4d. All performance metrics
+        performance_metrics[pt] = compute_all_performance_metrics(df, game_pk, pt, window)
+
+    # Combine game frames
+    game_df = pd.concat(game_frames, ignore_index=True) if game_frames else pd.DataFrame()
+
+    # Step 5: Pitch mix rolling (cross-type, wider window)
+    pitch_mix_df = compute_pitch_mix(df, game_pk, window=config.PITCH_MIX_WINDOW_DEFAULT)
+
+    # Get game date
+    game_date = "unknown"
+    if "game_date" in df.columns and config.GAME_PK_COL in df.columns:
+        date_series = df.loc[df[config.GAME_PK_COL] == game_pk, "game_date"]
+        if not date_series.empty:
+            game_date = str(date_series.iloc[0])
+
+    return ArsenalReport(
+        pitcher_id=resolved_id,
+        game_pk=game_pk,
+        game_date=game_date,
+        analyzed_pitch_types=list(pitch_types),
+        cluster_models=cluster_models,
+        performance_metrics=performance_metrics,
+        rolling_spreads=rolling_spreads_by_type,
+        rolling_miss=rolling_miss_by_type,
+        pitch_mix_df=pitch_mix_df,
+        game_df=game_df,
+        params={
+            "window": window,
+            "k": k,
+            "min_pitches": min_pitches,
+            "start_date": start_date,
+            "end_date": end_date,
+            "use_cache": use_cache,
+        },
+        warnings=warnings_out,
+    )
