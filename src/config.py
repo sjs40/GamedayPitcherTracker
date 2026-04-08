@@ -92,6 +92,13 @@ STATCAST_DESIRED_COLS: list[str] = [
     "description",
     "events",
     "zone",
+    # Movement (inches, pitcher's perspective)
+    "pfx_x",
+    "pfx_z",
+    # Release point (feet)
+    "release_pos_x",
+    "release_pos_z",
+    "release_pos_y",
 ]
 
 # Columns that must be non-null for a pitch to be usable in location analysis
@@ -103,7 +110,46 @@ LOCATION_REQUIRED_COLS: list[str] = ["plate_x", "plate_z", "pitch_type"]
 BUCKET_LABELS: list[str] = ["early", "mid", "late"]
 
 # ---------------------------------------------------------------------------
+# Pitch outcome classification (derived from Statcast 'description' column)
+# Used by features/performance.py to encode boolean indicators.
+# ---------------------------------------------------------------------------
+STRIKE_DESCRIPTIONS: frozenset = frozenset([
+    "called_strike", "swinging_strike", "swinging_strike_blocked",
+    "foul", "foul_tip", "foul_bunt", "missed_bunt",
+])
+WHIFF_DESCRIPTIONS: frozenset = frozenset([
+    "swinging_strike", "swinging_strike_blocked", "missed_bunt",
+])
+SWING_DESCRIPTIONS: frozenset = frozenset([
+    "swinging_strike", "swinging_strike_blocked",
+    "hit_into_play", "hit_into_play_score", "hit_into_play_no_out",
+    "foul", "foul_tip", "foul_bunt", "missed_bunt",
+])
+# Statcast zones 1-9 are inside the strike zone; 11+ are outside
+IN_ZONE_VALUES: frozenset = frozenset(range(1, 10))
+
+# ---------------------------------------------------------------------------
 # Visualization defaults
 # ---------------------------------------------------------------------------
 CLUSTER_COLORS: list[str] = ["#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00"]
 FIGURE_DPI: int = 120
+
+# Pitch-type color palette — consistent across all charts
+# Fallback to _default for any pitch type not listed here
+PITCH_TYPE_COLORS: dict[str, str] = {
+    "FF": "#e41a1c",   # four-seam fastball — red
+    "SI": "#ff7f00",   # sinker — orange
+    "FC": "#f781bf",   # cutter — pink
+    "SL": "#377eb8",   # slider — blue
+    "CU": "#984ea3",   # curveball — purple
+    "KC": "#a65628",   # knuckle-curve — brown
+    "CH": "#4daf4a",   # changeup — green
+    "FS": "#999999",   # splitter — gray
+    "ST": "#a6cee3",   # sweeper — light blue
+    "SV": "#b2df8a",   # slurve — light green
+    "CS": "#cab2d6",   # slow curve — lavender
+    "_default": "#888888",
+}
+
+# Wider rolling window for pitch mix (individual type frequencies are sparse)
+PITCH_MIX_WINDOW_DEFAULT: int = 15

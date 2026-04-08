@@ -255,3 +255,324 @@ def plot_rolling_miss(
     ax.set_title(title or "Rolling Miss Distance from Location Hub", fontsize=11)
     fig.tight_layout()
     return fig
+
+
+# ---------------------------------------------------------------------------
+# Velocity trend
+# ---------------------------------------------------------------------------
+
+def prep_velocity_trend(velocity_df: pd.DataFrame) -> dict:
+    """
+    Prepare rolling velocity data for charting.
+
+    Parameters
+    ----------
+    velocity_df : pd.DataFrame
+        Output of compute_rolling_velocity(). Must contain game_pitch_index,
+        release_speed, rolling_velo_mean, rolling_velo_std.
+
+    Returns
+    -------
+    dict with keys:
+        'pitch_index'        : pd.Series
+        'release_speed'      : pd.Series  (raw)
+        'rolling_velo_mean'  : pd.Series
+        'rolling_velo_std'   : pd.Series
+        'velo_drop'          : float | None  (first-10 mean minus last-10 mean)
+        'has_data'           : bool
+    """
+    from src.features.performance import ROLLING_VELO_MEAN_COL, ROLLING_VELO_STD_COL
+
+    if velocity_df.empty or GAME_PITCH_INDEX_COL not in velocity_df.columns:
+        return {
+            "pitch_index": pd.Series([], dtype=float),
+            "release_speed": pd.Series([], dtype=float),
+            "rolling_velo_mean": pd.Series([], dtype=float),
+            "rolling_velo_std": pd.Series([], dtype=float),
+            "velo_drop": None,
+            "has_data": False,
+        }
+
+    df = velocity_df.sort_values(GAME_PITCH_INDEX_COL)
+    speed = df["release_speed"].dropna()
+
+    velo_drop: float | None = None
+    if len(speed) >= 10:
+        first10 = speed.iloc[:10].mean()
+        last10 = speed.iloc[-10:].mean()
+        velo_drop = float(first10 - last10)
+
+    return {
+        "pitch_index": df[GAME_PITCH_INDEX_COL],
+        "release_speed": df["release_speed"],
+        "rolling_velo_mean": df[ROLLING_VELO_MEAN_COL] if ROLLING_VELO_MEAN_COL in df.columns else pd.Series(),
+        "rolling_velo_std": df[ROLLING_VELO_STD_COL] if ROLLING_VELO_STD_COL in df.columns else pd.Series(),
+        "velo_drop": velo_drop,
+        "has_data": True,
+    }
+
+
+def plot_velocity_trend(
+    prepped: dict,
+    title: str = "",
+    window: int = config.ROLLING_WINDOW_DEFAULT,
+) -> Figure:
+    """
+    Line chart of rolling mean velocity with ±1 std shading.
+
+    Annotates the velocity drop from first 10 pitches to last 10 pitches.
+
+    Parameters
+    ----------
+    prepped : dict
+        Output of prep_velocity_trend().
+    title : str
+    window : int
+
+    Returns
+    -------
+    Figure
+    """
+    VELO_COLOR = "#1b7837"
+
+    fig, ax = plt.subplots(figsize=(9, 4), dpi=config.FIGURE_DPI)
+
+    if not prepped["has_data"]:
+        ax.set_title("No velocity data available")
+        return fig
+
+    idx = prepped["pitch_index"]
+    mean = prepped["rolling_velo_mean"]
+    std = prepped["rolling_velo_std"]
+
+    # Raw scatter (faint)
+    if not prepped["release_speed"].empty:
+        ax.scatter(idx, prepped["release_speed"],
+                   c=VELO_COLOR, alpha=0.2, s=12, zorder=2)
+
+    # Rolling mean
+    if not mean.empty:
+        ax.plot(idx, mean, color=VELO_COLOR, linewidth=2.0, zorder=3,
+                label=f"Rolling mean velocity (w={window})")
+
+    # ±1 std shading
+    if not mean.empty and not std.empty:
+        lo = mean - std
+        hi = mean + std
+        ax.fill_between(idx, lo, hi, alpha=0.15, color=VELO_COLOR, zorder=1)
+
+    ax.set_xlabel("Pitch # within game", fontsize=9)
+    ax.set_ylabel("Velocity (mph)", fontsize=9)
+    ax.legend(fontsize=9)
+    ax.grid(linestyle="--", alpha=0.4)
+
+    # Annotate velocity drop
+    drop = prepped.get("velo_drop")
+    if drop is not None:
+        sign = "+" if drop < 0 else "-"
+        ax.annotate(
+            f"Velocity change first→last 10: {sign}{abs(drop):.1f} mph",
+            xy=(0.01, 0.04),
+            xycoords="axes fraction",
+            fontsize=8,
+            color="gray",
+        )
+
+    ax.set_title(title or "Rolling Velocity Trend", fontsize=11)
+    fig.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Performance panel (strike%, zone%, whiff%)
+# ---------------------------------------------------------------------------
+
+def prep_performance_panel(metrics: dict[str, pd.DataFrame]) -> dict:
+    """
+    Combine strike_pct, whiff_rate, and zone_pct DataFrames into one
+    chart-ready dict.
+
+    Parameters
+    ----------
+    metrics : dict[str, pd.DataFrame]
+        Dict keyed by metric name as returned by compute_all_performance_metrics().
+        Relevant keys: 'strike_pct', 'whiff_rate', 'zone_pct'.
+
+    Returns
+    -------
+    dict with keys:
+        'strike_pct'   : dict('pitch_index', 'values') or None
+        'whiff_rate'   : dict('pitch_index', 'values') or None
+        'zone_pct'     : dict('pitch_index', 'values') or None
+        'has_data'     : bool
+    """
+    from src.features.performance import (
+        ROLLING_STRIKE_PCT_COL, ROLLING_WHIFF_RATE_COL, ROLLING_ZONE_PCT_COL
+    )
+
+    def _extract(df: pd.DataFrame, val_col: str) -> dict | None:
+        if df.empty or GAME_PITCH_INDEX_COL not in df.columns or val_col not in df.columns:
+            return None
+        df = df.sort_values(GAME_PITCH_INDEX_COL)
+        return {
+            "pitch_index": df[GAME_PITCH_INDEX_COL],
+            "values": df[val_col],
+        }
+
+    strike = _extract(metrics.get("strike_pct", pd.DataFrame()), ROLLING_STRIKE_PCT_COL)
+    whiff = _extract(metrics.get("whiff_rate", pd.DataFrame()), ROLLING_WHIFF_RATE_COL)
+    zone = _extract(metrics.get("zone_pct", pd.DataFrame()), ROLLING_ZONE_PCT_COL)
+
+    has_data = any(x is not None for x in [strike, whiff, zone])
+    return {
+        "strike_pct": strike,
+        "whiff_rate": whiff,
+        "zone_pct": zone,
+        "has_data": has_data,
+    }
+
+
+def plot_performance_panel(
+    prepped: dict,
+    title: str = "",
+    window: int = config.ROLLING_WINDOW_DEFAULT,
+) -> Figure:
+    """
+    Multi-line chart: strike%, zone%, and whiff% on shared axes.
+
+    strike% — solid line, blue
+    zone%   — dashed line, green
+    whiff%  — dotted line, orange
+
+    X = pitch number. Annotates early vs. late 10-pitch means for each line.
+
+    Parameters
+    ----------
+    prepped : dict
+        Output of prep_performance_panel().
+    title : str
+    window : int
+
+    Returns
+    -------
+    Figure
+    """
+    fig, ax = plt.subplots(figsize=(9, 4), dpi=config.FIGURE_DPI)
+
+    if not prepped["has_data"]:
+        ax.set_title("No performance data available")
+        return fig
+
+    STRIKE_COLOR = "#2166ac"
+    ZONE_COLOR = "#4dac26"
+    WHIFF_COLOR = "#e08214"
+
+    panel_specs = [
+        ("strike_pct", "Strike%", STRIKE_COLOR, "-"),
+        ("zone_pct", "Zone%", ZONE_COLOR, "--"),
+        ("whiff_rate", "Whiff%", WHIFF_COLOR, ":"),
+    ]
+
+    for key, label, color, ls in panel_specs:
+        entry = prepped.get(key)
+        if entry is None:
+            continue
+        idx = entry["pitch_index"]
+        vals = entry["values"]
+        ax.plot(idx, vals * 100, color=color, linewidth=1.8,
+                linestyle=ls, label=f"{label} (w={window})", zorder=3)
+
+    ax.set_xlabel("Pitch # within game", fontsize=9)
+    ax.set_ylabel("Rate (%)", fontsize=9)
+    ax.legend(fontsize=9)
+    ax.grid(linestyle="--", alpha=0.4)
+    ax.set_title(title or "Rolling Performance Rates", fontsize=11)
+    fig.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Pitch mix trend
+# ---------------------------------------------------------------------------
+
+def prep_pitch_mix_trend(mix_df: pd.DataFrame) -> dict:
+    """
+    Prepare pitch mix % over time for the multi-line mix chart.
+
+    Parameters
+    ----------
+    mix_df : pd.DataFrame
+        Output of compute_pitch_mix(). Contains game_pitch_index and
+        one {pt}_pct column per pitch type.
+
+    Returns
+    -------
+    dict with keys:
+        'pitch_index' : pd.Series
+        'mix_cols'    : list[str]  column names ending in '_pct'
+        'color_map'   : dict[str, str]
+        'mix_df'      : pd.DataFrame
+        'has_data'    : bool
+    """
+    if mix_df.empty or GAME_PITCH_INDEX_COL not in mix_df.columns:
+        return {"pitch_index": pd.Series([], dtype=float), "mix_cols": [],
+                "color_map": {}, "mix_df": pd.DataFrame(), "has_data": False}
+
+    mix_df = mix_df.sort_values(GAME_PITCH_INDEX_COL).reset_index(drop=True)
+    mix_cols = [c for c in mix_df.columns if c.endswith("_pct")]
+
+    color_map = {}
+    for col in mix_cols:
+        pt = col[:-4]  # strip "_pct"
+        color_map[col] = config.PITCH_TYPE_COLORS.get(
+            pt, config.PITCH_TYPE_COLORS["_default"]
+        )
+
+    return {
+        "pitch_index": mix_df[GAME_PITCH_INDEX_COL],
+        "mix_cols": mix_cols,
+        "color_map": color_map,
+        "mix_df": mix_df,
+        "has_data": True,
+    }
+
+
+def plot_pitch_mix_trend(prepped: dict, title: str = "") -> Figure:
+    """
+    Multi-line chart showing rolling usage % of each pitch type over game sequence.
+
+    Each line = one pitch type, colored by PITCH_TYPE_COLORS.
+
+    Parameters
+    ----------
+    prepped : dict
+        Output of prep_pitch_mix_trend().
+    title : str
+
+    Returns
+    -------
+    Figure
+    """
+    fig, ax = plt.subplots(figsize=(9, 4), dpi=config.FIGURE_DPI)
+
+    if not prepped["has_data"]:
+        ax.set_title("No pitch mix data available")
+        return fig
+
+    idx = prepped["pitch_index"]
+    mix_df = prepped["mix_df"]
+
+    for col in prepped["mix_cols"]:
+        pt = col[:-4]
+        color = prepped["color_map"].get(col, "#888888")
+        ax.plot(idx, mix_df[col] * 100, color=color, linewidth=1.8,
+                label=pt, zorder=3)
+
+    ax.set_xlabel("Pitch # within game", fontsize=9)
+    ax.set_ylabel("Rolling usage (%)", fontsize=9)
+    ax.set_ylim(0, 105)
+    ax.legend(fontsize=9, title="Pitch type", loc="upper right")
+    ax.grid(linestyle="--", alpha=0.4)
+    ax.set_title(title or "Rolling Pitch Mix", fontsize=11)
+    fig.tight_layout()
+    return fig
